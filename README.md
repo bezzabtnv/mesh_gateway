@@ -197,6 +197,3 @@ python mesh_gateway.py
 - [meshtastic-python](https://github.com/meshtastic/meshtastic-python) – за API для взаимодействия с устройством.
 
 ---
-
-> [!NOTE]
-> Если у вас возникли вопросы или предложения, создавайте [issue](https://github.com/yourusername/meshtastic-telegram-gateway/issues) в репозитории.

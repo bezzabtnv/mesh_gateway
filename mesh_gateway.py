@@ -68,6 +68,7 @@ class PendingMessage:
         self.delivery_time = None
         self.delivered_at = None
         self.ack_received = False
+        self.mesh_packet_id = None  # ID пакета Meshtastic
 
     def mark_as_delivered(self, delivery_time: float):
         self.status = 'delivered'
@@ -182,18 +183,24 @@ class MessageTracker:
         self.last_packet_ids: Dict[str, Dict] = {}
         self.reaction_queue = queue.Queue()
         self.sent_messages_by_time: Dict[float, Tuple[str, str]] = {}
+        self.sent_messages_by_id: Dict[int, Tuple[str, str]] = {}  # По ID пакета
         self.cleanup_timer = None
         self._start_cleanup_timer()
 
-    def add_sent_message(self, chat_id: str, message_hash: str, sent_time: float):
+    def add_sent_message(self, chat_id: str, message_hash: str, sent_time: float, mesh_packet_id: int = None):
         rounded = round(sent_time, 1)
         self.sent_messages_by_time[rounded] = (chat_id, message_hash)
+        if mesh_packet_id:
+            self.sent_messages_by_id[mesh_packet_id] = (chat_id, message_hash)
 
     def find_message_by_time(self, ack_time: float, tolerance: float = 5.0) -> Optional[Tuple[str, str]]:
         for t, (cid, h) in self.sent_messages_by_time.items():
             if abs(ack_time - t) < tolerance:
                 return cid, h
         return None
+
+    def find_message_by_id(self, mesh_packet_id: int) -> Optional[Tuple[str, str]]:
+        return self.sent_messages_by_id.get(mesh_packet_id)
 
     def _start_cleanup_timer(self):
         self.cleanup_timer = threading.Timer(300, self._cleanup_old_entries)
@@ -206,6 +213,12 @@ class MessageTracker:
             old_keys = [t for t in self.sent_messages_by_time.keys() if now - t > 300]
             for k in old_keys:
                 del self.sent_messages_by_time[k]
+            
+            # Очистка старых записей по ID
+            old_ids = [pid for pid, (cid, h) in self.sent_messages_by_id.items() 
+                      if now - pid > 300]  # pid используется как время? нужно хранить время
+            for pid in old_ids:
+                del self.sent_messages_by_id[pid]
             
             old_nodes = [n for n, d in self.last_packet_ids.items() if now - d.get('timestamp', 0) > 3600]
             for n in old_nodes:
@@ -424,7 +437,6 @@ class MeshtasticGateway:
                     bot = callback.__self__.bot
                     allowed_chats = self.config.get('allowed_chat_ids', [])
                     if not allowed_chats:
-                        # Если нет ограничений, уведомляем всех пользователей
                         for chat_id, user in callback.__self__.user_settings.items():
                             try:
                                 bot.send_message(chat_id, message, disable_notification=True)
@@ -520,25 +532,24 @@ class MeshtasticGateway:
                             app_logger.error(f"Ошибка callback: {e}")
 
             elif portnum in ['ROUTING_APP', 'ACK_APP']:
-                target = self.config.get('target_node', '')
-                if target and node_id == target:
-                    for callback in self.message_callbacks:
-                        try:
-                            callback('routing_ack', {
-                                'mesh_packet_id': mesh_packet_id,
-                                'from_node': target,
-                                'rx_time': rx_time
-                            })
-                        except Exception as e:
-                            app_logger.error(f"Ошибка callback ACK: {e}")
+                # ACK может приходить от любой ноды
+                for callback in self.message_callbacks:
+                    try:
+                        callback('routing_ack', {
+                            'mesh_packet_id': mesh_packet_id,
+                            'from_node': node_id,
+                            'rx_time': rx_time
+                        })
+                    except Exception as e:
+                        app_logger.error(f"Ошибка callback ACK: {e}")
 
         except Exception as e:
             app_logger.error(f"Ошибка обработки пакета: {e}")
 
-    def send_message(self, text: str, channel: int = 0, broadcast: bool = False) -> Tuple[bool, str, float]:
+    def send_message(self, text: str, channel: int = 0, broadcast: bool = False) -> Tuple[bool, str, float, int]:
         try:
             if not self.is_connected:
-                return False, "", 0.0
+                return False, "", 0.0, 0
             
             sent_time = time.time()
             message_hash = hashlib.md5(f"{text}:{sent_time}:{random.random()}".encode()).hexdigest()[:16]
@@ -556,6 +567,7 @@ class MeshtasticGateway:
                 if len(text_bytes) > len(truncated):
                     text = text.rstrip() + "..."
             
+            mesh_packet_id = None
             if broadcast:
                 self.interface.sendText(text, destinationId="^all", wantAck=False, wantResponse=False, channelIndex=channel)
             else:
@@ -563,15 +575,14 @@ class MeshtasticGateway:
                 if target:
                     self.interface.sendText(text, destinationId=target, wantAck=True, wantResponse=False, channelIndex=channel)
                 else:
-                    # Если нет целевой ноды, отправляем широковещательно
                     self.interface.sendText(text, destinationId="^all", wantAck=False, wantResponse=False, channelIndex=channel)
             
             self.last_heartbeat_time = time.time()
             
-            return True, message_hash, sent_time
+            return True, message_hash, sent_time, mesh_packet_id
         except Exception as e:
             app_logger.error(f"Ошибка отправки: {e}")
-            return False, "", 0.0
+            return False, "", 0.0, 0
 
 
 class MultiUserGateway:
@@ -654,7 +665,6 @@ class MultiUserGateway:
     def _notify_all_users(self, message: str):
         allowed_chats = self.config.get('allowed_chat_ids', [])
         if not allowed_chats:
-            # Уведомляем всех активных пользователей
             for chat_id in self.user_settings.keys():
                 try:
                     self.bot.send_message(chat_id, message, disable_notification=True)
@@ -694,12 +704,10 @@ class MultiUserGateway:
         user = self.user_settings.get(chat_id)
         if not user:
             user = UserSettings(chat_id)
-            # Если нет целевой ноды, принудительно устанавливаем режим радио
             if not self.has_target_node:
                 user.set_mode(RadioMode.RADIO)
             self.user_settings[chat_id] = user
             
-        # Показываем кнопку переключения режима только если есть целевая нода
         if self.has_target_node:
             if user.mode == RadioMode.GATEWAY:
                 markup.add(KeyboardButton("📡 Режим радио"))
@@ -711,14 +719,12 @@ class MultiUserGateway:
         markup.row(KeyboardButton("📊 Статус"), KeyboardButton("📜 История радио"))
         markup.row(KeyboardButton("ℹ️ Помощь"), KeyboardButton("🔄 Перезагрузить"))
         
-        # Кнопки управления ping
         ping_row = []
         if self.ping_mode == PingMode.OFF:
             ping_row.append(KeyboardButton("✅ Ping: Вкл"))
         else:
             ping_row.append(KeyboardButton("🚫 Ping: Выкл"))
         
-        # Кнопка выбора канала для ping
         ping_row.append(KeyboardButton(f"📻 Ping канал: {self.ping_channel}"))
         markup.row(*ping_row)
         
@@ -726,7 +732,6 @@ class MultiUserGateway:
 
     def is_allowed_chat(self, chat_id: str) -> bool:
         allowed_chats = self.config.get('allowed_chat_ids', [])
-        # Если список пуст - разрешены все чаты
         if not allowed_chats:
             return True
         return chat_id in allowed_chats
@@ -825,10 +830,26 @@ class MultiUserGateway:
                 rx_time = packet_data.get('rx_time', time.time())
                 from_node = packet_data.get('from_node', 'Unknown')
                 
-                target_node = self.config.get('target_node', '')
-                if target_node and from_node == target_node:
+                # Ищем сообщение по ID пакета
+                result = self.tracker.find_message_by_id(mesh_id)
+                
+                if result:
+                    chat_id, msg_hash = result
+                    user = self.user_settings.get(chat_id)
+                    if user:
+                        pend = user.get_pending_message(msg_hash)
+                        if pend:
+                            delivery = rx_time - pend.sent_time
+                            pend.mark_as_delivered(delivery)
+                            self.tracker.add_reaction_task(chat_id, pend.telegram_msg_id, 'delivered', delivery)
+                            user.remove_pending_message(msg_hash)
+                            if msg_hash in self.timeout_timers:
+                                self.timeout_timers[msg_hash].cancel()
+                                del self.timeout_timers[msg_hash]
+                            app_logger.info(f"ACK получен для сообщения {msg_hash} через {delivery:.1f}с от {from_node}")
+                else:
+                    # Если не нашли по ID, пробуем по времени
                     result = self.tracker.find_message_by_time(rx_time)
-                    
                     if result:
                         chat_id, msg_hash = result
                         user = self.user_settings.get(chat_id)
@@ -842,8 +863,10 @@ class MultiUserGateway:
                                 if msg_hash in self.timeout_timers:
                                     self.timeout_timers[msg_hash].cancel()
                                     del self.timeout_timers[msg_hash]
+                                app_logger.info(f"ACK получен для сообщения {msg_hash} через {delivery:.1f}с от {from_node}")
                     else:
-                        self._try_find_message_in_recent(rx_time)
+                        # Ищем по всем пользователям
+                        self._try_find_message_in_recent(rx_time, mesh_id)
                         
         except Exception as e:
             app_logger.error(f"Ошибка обработки пакета: {e}")
@@ -862,6 +885,7 @@ class MultiUserGateway:
             else:
                 response_text = f'Слышу {from_node}'
             
+            # Уведомляем всех пользователей (в любом режиме)
             for chat_id, user in self.user_settings.items():
                 if user.mode == RadioMode.RADIO:
                     try:
@@ -875,20 +899,23 @@ class MultiUserGateway:
                     except Exception as e:
                         app_logger.error(f"Ошибка уведомления {chat_id}: {e}")
             
+            # Отправляем ответ в сеть, если включен AUTO режим
             if self.ping_mode == PingMode.AUTO:
                 self.meshtastic.send_message(response_text, channel=self.ping_channel, broadcast=True)
                     
         except Exception as e:
             app_logger.error(f"Ошибка обработки ping: {e}")
 
-    def _try_find_message_in_recent(self, ack_time: float):
+    def _try_find_message_in_recent(self, ack_time: float, mesh_id: int = None):
         for cid, user in self.user_settings.items():
             if user.mode == RadioMode.GATEWAY:
                 recent = user.find_recent_messages(max_age=30.0)
                 for h, pend in recent:
                     if not pend.ack_received:
                         diff = abs(ack_time - pend.sent_time)
-                        if diff < 10.0:
+                        id_match = mesh_id and pend.mesh_packet_id == mesh_id
+                        
+                        if diff < 10.0 or id_match:
                             delivery = ack_time - pend.sent_time
                             pend.mark_as_delivered(delivery)
                             self.tracker.add_reaction_task(cid, pend.telegram_msg_id, 'delivered', delivery)
@@ -896,8 +923,9 @@ class MultiUserGateway:
                             if h in self.timeout_timers:
                                 self.timeout_timers[h].cancel()
                                 del self.timeout_timers[h]
-                            self.tracker.add_sent_message(cid, h, pend.sent_time)
-                            return
+                            self.tracker.add_sent_message(cid, h, pend.sent_time, pend.mesh_packet_id)
+                            return True
+        return False
 
     def _setup_timeout_timer(self, message_hash: str, chat_id: str, telegram_msg_id: int):
         def handler():
@@ -924,7 +952,6 @@ class MultiUserGateway:
             
             if chat_id not in self.user_settings:
                 user = UserSettings(chat_id)
-                # Если нет целевой ноды, принудительно устанавливаем режим радио
                 if not self.has_target_node:
                     user.set_mode(RadioMode.RADIO)
                 self.user_settings[chat_id] = user
@@ -981,8 +1008,7 @@ class MultiUserGateway:
                 return
                 
             if text.startswith("📻 Ping канал:"):
-                # Смена канала для ping
-                new_channel = (self.ping_channel + 1) % 8  # Циклически 0-7
+                new_channel = (self.ping_channel + 1) % 8
                 self.set_ping_channel(new_channel, chat_id)
                 return
             
@@ -1005,15 +1031,19 @@ class MultiUserGateway:
                                       reply_to_message_id=message.message_id, disable_notification=True)
             
             if user.mode == RadioMode.RADIO:
-                ok, h, t = self.meshtastic.send_message(text, channel=0, broadcast=True)
+                ok, h, t, mesh_id = self.meshtastic.send_message(text, channel=0, broadcast=True)
                 if ok:
                     self.reactions.set_reaction(chat_id, message.message_id, 'sent')
             else:
                 if self.has_target_node:
-                    ok, h, t = self.meshtastic.send_message(text, channel=0, broadcast=False)
+                    ok, h, t, mesh_id = self.meshtastic.send_message(text, channel=0, broadcast=False)
                     if ok:
                         user.add_pending_message(h, message.message_id, text, t)
-                        self.tracker.add_sent_message(chat_id, h, t)
+                        # Сохраняем mesh_packet_id если он доступен
+                        pend = user.get_pending_message(h)
+                        if pend:
+                            pend.mesh_packet_id = mesh_id
+                        self.tracker.add_sent_message(chat_id, h, t, mesh_id)
                         self._setup_timeout_timer(h, chat_id, message.message_id)
                         self.reactions.set_reaction(chat_id, message.message_id, 'sent')
                     else:
