@@ -1,0 +1,11 @@
+# Основные зависимости
+telebot==0.0.5
+meshtastic==2.1.0
+pubsub==0.3.0
+requests==2.31.0
+
+# Дополнительные зависимости (устанавливаются автоматически)
+typing-extensions>=4.8.0
+pyserial>=3.5
+protobuf>=4.25.0
+cryptography>=41.0.7
